@@ -1,0 +1,13 @@
+torch
+torchvision
+timm
+numpy
+scipy
+Pillow
+omegaconf
+pytorch-lightning
+tqdm
+einops
+matplotlib
+tensorboard
+flash-attn
