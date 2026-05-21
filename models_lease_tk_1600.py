@@ -912,6 +912,7 @@ class LEASE_DecLoss_ViT(nn.Module):
     # =========================
 
 
+    @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -1098,17 +1099,26 @@ class LEASE_DecLoss_ViT(nn.Module):
             tau = self.masked_dino_tau
 
         supervise_mask = (mask_full_257[:, 1:] > 0)  # (B,256) bool
-        if not supervise_mask.any():
-            return dec_feats_257.new_tensor(0.0)
 
         dec_256 = dec_feats_257[:, 1:, :]                           # (B,256,Dd)
-        z = self.dec_to_dino(dec_256[supervise_mask].contiguous())  # [N,D]
+        z = self.dec_to_dino(dec_256)                                # (B,256,D)
         z = F.normalize(z, dim=-1)
 
         C = F.normalize(self.dino_codebook, dim=-1)                 # [K,D]
-        t = dino_idx_256[supervise_mask].long()                     # [N]
-        logits = F.linear(z, C) / tau                               # [N,K]
-        return F.cross_entropy(logits.float(), t)
+        t = dino_idx_256.long()                                      # (B,256)
+        logits = F.linear(z, C) / tau                                # (B,256,K)
+
+        B_ce, S_ce, K_ce = logits.shape
+        logits_flat = logits.reshape(B_ce * S_ce, K_ce)
+        targets_flat = t.reshape(B_ce * S_ce)
+        mask_flat = supervise_mask.reshape(B_ce * S_ce)
+        ignore_idx = -100
+        targets_flat = torch.where(
+            mask_flat,
+            targets_flat,
+            torch.full_like(targets_flat, ignore_idx)
+        )
+        return F.cross_entropy(logits_flat.float(), targets_flat, ignore_index=ignore_idx)
 
     # =========================
     # Forward
@@ -1144,21 +1154,32 @@ class LEASE_DecLoss_ViT(nn.Module):
         vq_feats_kept = x_with_cls[:, 1:129, :]                         # (B,128,E)
         kept_mask = torch.take_along_dim(masked_256, keep_idx, dim=1)   # (B,128) True=masked among kept
         visible_mask = ~kept_mask                                       # (B,128)
-        if visible_mask.any():
-            z_vis = vq_feats_kept[visible_mask].contiguous()            # [N,E]
-            t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1)[visible_mask].contiguous().long()  # [N]
-            z_vis = self.proj_to_dino(z_vis)                            # [N,D]
-            if self.use_neighbor_targets and self.neighbor_topk > 0:
-                info_nce_loss = self.info_nce_visible_neighbors(
-                    z_vis, t_vis,
-                    topk=self.neighbor_topk,
-                    teacher_tau=self.neighbor_teacher_tau,
-                    loss_tau=self.info_nce_tau
-                )
-            else:
-                info_nce_loss = self.info_nce_visible_full(z_vis, t_vis)
+
+        z_vis = self.proj_to_dino(vq_feats_kept)                         # (B,128,D)
+        t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1).long()   # (B,128)
+
+        B_vis, S_vis = z_vis.shape[:2]
+        z_vis_flat = z_vis.reshape(B_vis * S_vis, -1)
+        t_vis_flat = t_vis.reshape(B_vis * S_vis)
+        mask_flat = visible_mask.reshape(B_vis * S_vis)
+
+        if self.use_neighbor_targets and self.neighbor_topk > 0:
+            t_vis_safe = torch.where(mask_flat, t_vis_flat, torch.zeros_like(t_vis_flat))
+            raw_loss = self.info_nce_visible_neighbors(
+                z_vis_flat, t_vis_safe,
+                topk=self.neighbor_topk,
+                teacher_tau=self.neighbor_teacher_tau,
+                loss_tau=self.info_nce_tau
+            )
+            w = mask_flat.to(z_vis_flat.dtype)
+            info_nce_loss = (raw_loss * w).sum() / (w.sum().clamp(min=1))
         else:
-            info_nce_loss = x_with_cls.new_tensor(0.0)
+            z_norm = F.normalize(z_vis_flat, dim=-1)
+            C_norm = F.normalize(self.dino_codebook, dim=-1)
+            logits = F.linear(z_norm, C_norm) / self.info_nce_tau
+            ignore_idx = -100
+            t_masked = torch.where(mask_flat, t_vis_flat, torch.full_like(t_vis_flat, ignore_idx))
+            info_nce_loss = F.cross_entropy(logits.float(), t_masked, ignore_index=ignore_idx)
 
         # ---- Optional online classifier ----
         if labels is not None:
@@ -1351,6 +1372,7 @@ class LEASEViT(nn.Module):
     # =========================
 
 
+    @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -1537,17 +1559,26 @@ class LEASEViT(nn.Module):
             tau = self.masked_dino_tau
 
         supervise_mask = (mask_full_257[:, 1:] > 0)  # (B,256) bool
-        if not supervise_mask.any():
-            return dec_feats_257.new_tensor(0.0)
 
         dec_256 = dec_feats_257[:, 1:, :]                           # (B,256,Dd)
-        z = self.dec_to_dino(dec_256[supervise_mask].contiguous())  # [N,D]
+        z = self.dec_to_dino(dec_256)                                # (B,256,D)
         z = F.normalize(z, dim=-1)
 
         C = F.normalize(self.dino_codebook, dim=-1)                 # [K,D]
-        t = dino_idx_256[supervise_mask].long()                     # [N]
-        logits = F.linear(z, C) / tau                               # [N,K]
-        return F.cross_entropy(logits.float(), t)
+        t = dino_idx_256.long()                                      # (B,256)
+        logits = F.linear(z, C) / tau                                # (B,256,K)
+
+        B_ce, S_ce, K_ce = logits.shape
+        logits_flat = logits.reshape(B_ce * S_ce, K_ce)
+        targets_flat = t.reshape(B_ce * S_ce)
+        mask_flat = supervise_mask.reshape(B_ce * S_ce)
+        ignore_idx = -100
+        targets_flat = torch.where(
+            mask_flat,
+            targets_flat,
+            torch.full_like(targets_flat, ignore_idx)
+        )
+        return F.cross_entropy(logits_flat.float(), targets_flat, ignore_index=ignore_idx)
 
     # =========================
     # Forward
@@ -1583,21 +1614,32 @@ class LEASEViT(nn.Module):
         vq_feats_kept = x_with_cls[:, 1:129, :]                         # (B,128,E)
         kept_mask = torch.take_along_dim(masked_256, keep_idx, dim=1)   # (B,128) True=masked among kept
         visible_mask = ~kept_mask                                       # (B,128)
-        if visible_mask.any():
-            z_vis = vq_feats_kept[visible_mask].contiguous()            # [N,E]
-            t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1)[visible_mask].contiguous().long()  # [N]
-            z_vis = self.proj_to_dino(z_vis)                            # [N,D]
-            if self.use_neighbor_targets and self.neighbor_topk > 0:
-                info_nce_loss = self.info_nce_visible_neighbors(
-                    z_vis, t_vis,
-                    topk=self.neighbor_topk,
-                    teacher_tau=self.neighbor_teacher_tau,
-                    loss_tau=self.info_nce_tau
-                )
-            else:
-                info_nce_loss = self.info_nce_visible_full(z_vis, t_vis)
+
+        z_vis = self.proj_to_dino(vq_feats_kept)                         # (B,128,D)
+        t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1).long()   # (B,128)
+
+        B_vis, S_vis = z_vis.shape[:2]
+        z_vis_flat = z_vis.reshape(B_vis * S_vis, -1)
+        t_vis_flat = t_vis.reshape(B_vis * S_vis)
+        mask_flat = visible_mask.reshape(B_vis * S_vis)
+
+        if self.use_neighbor_targets and self.neighbor_topk > 0:
+            t_vis_safe = torch.where(mask_flat, t_vis_flat, torch.zeros_like(t_vis_flat))
+            raw_loss = self.info_nce_visible_neighbors(
+                z_vis_flat, t_vis_safe,
+                topk=self.neighbor_topk,
+                teacher_tau=self.neighbor_teacher_tau,
+                loss_tau=self.info_nce_tau
+            )
+            w = mask_flat.to(z_vis_flat.dtype)
+            info_nce_loss = (raw_loss * w).sum() / (w.sum().clamp(min=1))
         else:
-            info_nce_loss = x_with_cls.new_tensor(0.0)
+            z_norm = F.normalize(z_vis_flat, dim=-1)
+            C_norm = F.normalize(self.dino_codebook, dim=-1)
+            logits = F.linear(z_norm, C_norm) / self.info_nce_tau
+            ignore_idx = -100
+            t_masked = torch.where(mask_flat, t_vis_flat, torch.full_like(t_vis_flat, ignore_idx))
+            info_nce_loss = F.cross_entropy(logits.float(), t_masked, ignore_index=ignore_idx)
 
         # ---- Optional online classifier ----
         if labels is not None:
@@ -1773,6 +1815,7 @@ class LeaseInference(nn.Module):
         denom = unmasked.sum(dim=1, keepdim=True).clamp_min(1.0)
         return (feats * unmasked.unsqueeze(-1)).sum(dim=1) / denom
 
+    @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -1928,17 +1971,26 @@ class LeaseInference(nn.Module):
             tau = self.masked_dino_tau
 
         supervise_mask = (mask_full_257[:, 1:] > 0)
-        if not supervise_mask.any():
-            return dec_feats_257.new_tensor(0.0)
 
         dec_256 = dec_feats_257[:, 1:, :]
-        z = self.dec_to_dino(dec_256[supervise_mask].contiguous())
+        z = self.dec_to_dino(dec_256)
         z = F.normalize(z, dim=-1)
 
         C = F.normalize(self.dino_codebook, dim=-1)
-        t = dino_idx_256[supervise_mask].long()
+        t = dino_idx_256.long()
         logits = F.linear(z, C) / tau
-        return F.cross_entropy(logits.float(), t)
+
+        B_ce, S_ce, K_ce = logits.shape
+        logits_flat = logits.reshape(B_ce * S_ce, K_ce)
+        targets_flat = t.reshape(B_ce * S_ce)
+        mask_flat = supervise_mask.reshape(B_ce * S_ce)
+        ignore_idx = -100
+        targets_flat = torch.where(
+            mask_flat,
+            targets_flat,
+            torch.full_like(targets_flat, ignore_idx)
+        )
+        return F.cross_entropy(logits_flat.float(), targets_flat, ignore_index=ignore_idx)
 
     def forward(self, vq_idx, dino_idx, labels, epoch):
         x_with_cls, gt_vq256, keep_idx, masked_256, dropped_256 = self.forward_encoder(vq_idx, labels)
@@ -1962,21 +2014,32 @@ class LeaseInference(nn.Module):
         vq_feats_kept = x_with_cls[:, 1:129, :]
         kept_mask = torch.take_along_dim(masked_256, keep_idx, dim=1)
         visible_mask = ~kept_mask
-        if visible_mask.any():
-            z_vis = vq_feats_kept[visible_mask].contiguous()
-            t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1)[visible_mask].contiguous().long()
-            z_vis = self.proj_to_dino(z_vis)
-            if self.use_neighbor_targets and self.neighbor_topk > 0:
-                info_nce_loss = self.info_nce_visible_neighbors(
-                    z_vis, t_vis,
-                    topk=self.neighbor_topk,
-                    teacher_tau=self.neighbor_teacher_tau,
-                    loss_tau=self.info_nce_tau
-                )
-            else:
-                info_nce_loss = self.info_nce_visible_full(z_vis, t_vis)
+
+        z_vis = self.proj_to_dino(vq_feats_kept)
+        t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1).long()
+
+        B_vis, S_vis = z_vis.shape[:2]
+        z_vis_flat = z_vis.reshape(B_vis * S_vis, -1)
+        t_vis_flat = t_vis.reshape(B_vis * S_vis)
+        mask_flat = visible_mask.reshape(B_vis * S_vis)
+
+        if self.use_neighbor_targets and self.neighbor_topk > 0:
+            t_vis_safe = torch.where(mask_flat, t_vis_flat, torch.zeros_like(t_vis_flat))
+            raw_loss = self.info_nce_visible_neighbors(
+                z_vis_flat, t_vis_safe,
+                topk=self.neighbor_topk,
+                teacher_tau=self.neighbor_teacher_tau,
+                loss_tau=self.info_nce_tau
+            )
+            w = mask_flat.to(z_vis_flat.dtype)
+            info_nce_loss = (raw_loss * w).sum() / (w.sum().clamp(min=1))
         else:
-            info_nce_loss = x_with_cls.new_tensor(0.0)
+            z_norm = F.normalize(z_vis_flat, dim=-1)
+            C_norm = F.normalize(self.dino_codebook, dim=-1)
+            logits = F.linear(z_norm, C_norm) / self.info_nce_tau
+            ignore_idx = -100
+            t_masked = torch.where(mask_flat, t_vis_flat, torch.full_like(t_vis_flat, ignore_idx))
+            info_nce_loss = F.cross_entropy(logits.float(), t_masked, ignore_index=ignore_idx)
 
         if labels is not None:
             y = labels.view(-1)
