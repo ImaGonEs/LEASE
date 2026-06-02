@@ -95,6 +95,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_dir',
                         help='path where to tensorboard log')
+    parser.add_argument('--compile', action='store_true', help='Apply torch.compile')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -335,6 +336,10 @@ def main(args):
 
     model.to(device)
     
+    if args.compile:
+        import torch as _torch
+        print('Applying torch.compile(reduce-overhead)...')
+        model = _torch.compile(model, mode='reduce-overhead')
 
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
