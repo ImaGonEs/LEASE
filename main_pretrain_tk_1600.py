@@ -366,7 +366,7 @@ def main(args):
 
 
 
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95), fused=True)
 
 
     print(optimizer)
