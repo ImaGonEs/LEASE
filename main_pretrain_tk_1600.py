@@ -339,7 +339,7 @@ def main(args):
     if args.compile:
         import torch as _torch
         print('Applying torch.compile(reduce-overhead)...')
-        model = _torch.compile(model, mode='reduce-overhead')
+        import torch._inductor.config as _ind_cfg; _ind_cfg.triton.cudagraphs = True; model = _torch.compile(model, mode="reduce-overhead")
 
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
