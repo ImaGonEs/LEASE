@@ -917,10 +917,10 @@ class LEASE_DecLoss_ViT(nn.Module):
 
     @torch.compiler.disable
     def _sample_mask_params(self, bsz, L, dev):
-        """Non-compilable: scipy truncnorm. Returns mask_rate (float), num_masked (int)."""
+        """Non-compilable: scipy truncnorm. Returns num_masked (int)."""
         mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
         num_masked = int(np.ceil(L * mask_rate))
-        return mask_rate, num_masked
+        return num_masked
 
     @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
@@ -936,13 +936,14 @@ class LEASE_DecLoss_ViT(nn.Module):
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        mask_rate, num_masked = self._sample_mask_params(bsz, L, dev)
-        mask_idx   = perm[:, :num_masked]
+        num_masked = self._sample_mask_params(bsz, L, dev)
 
+        # Fixed-shape boolean masks (no variable-length slice → compile-friendly)
+        ranks = torch.arange(L, device=dev).unsqueeze(0).expand(bsz, -1)
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
         dropped_256 = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
-        masked_256.scatter_(1, mask_idx, True)
-        dropped_256.scatter_(1, drop_idx, True)
+        masked_256.scatter_(1, perm, ranks < num_masked)
+        dropped_256.scatter_(1, perm, ranks < (L - K_keep))
 
         # ---- apply mask token to INPUT IDs only ----
         vq_masked = vq_idx.clone()
@@ -1383,10 +1384,10 @@ class LEASEViT(nn.Module):
 
     @torch.compiler.disable
     def _sample_mask_params(self, bsz, L, dev):
-        """Non-compilable: scipy truncnorm. Returns mask_rate (float), num_masked (int)."""
+        """Non-compilable: scipy truncnorm. Returns num_masked (int)."""
         mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
         num_masked = int(np.ceil(L * mask_rate))
-        return mask_rate, num_masked
+        return num_masked
 
     @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
@@ -1402,13 +1403,14 @@ class LEASEViT(nn.Module):
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        mask_rate, num_masked = self._sample_mask_params(bsz, L, dev)
-        mask_idx   = perm[:, :num_masked]
+        num_masked = self._sample_mask_params(bsz, L, dev)
 
+        # Fixed-shape boolean masks (no variable-length slice → compile-friendly)
+        ranks = torch.arange(L, device=dev).unsqueeze(0).expand(bsz, -1)
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
         dropped_256 = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
-        masked_256.scatter_(1, mask_idx, True)
-        dropped_256.scatter_(1, drop_idx, True)
+        masked_256.scatter_(1, perm, ranks < num_masked)
+        dropped_256.scatter_(1, perm, ranks < (L - K_keep))
 
         # ---- apply mask token to INPUT IDs only  ----
         vq_masked = vq_idx.clone()
@@ -1830,7 +1832,6 @@ class LeaseInference(nn.Module):
         denom = unmasked.sum(dim=1, keepdim=True).clamp_min(1.0)
         return (feats * unmasked.unsqueeze(-1)).sum(dim=1) / denom
 
-    @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
