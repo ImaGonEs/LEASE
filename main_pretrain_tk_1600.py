@@ -357,7 +357,7 @@ def main(args):
         model_without_ddp = model.module
     
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    param_groups = optim_factory.param_groups_weight_decay(model_without_ddp, args.weight_decay)
 
 
 

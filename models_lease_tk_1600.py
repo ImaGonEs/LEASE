@@ -30,6 +30,7 @@ try:
     from flash_attn import flash_attn_qkvpacked_func
     print("Successfully imported flash_attn_qkvpacked_func")
 except ImportError:
+    flash_attn_qkvpacked_func = None
     print("flash_attn_qkvpacked_func is not available, proceeding without it.")
 
 
@@ -267,23 +268,25 @@ class FlashAttentionLayer(nn.Module):
     def forward(self, x, causal=False):
         B, N, C = x.shape
         
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads) #.permute(2, 0, 3, 1, 4)
-        #q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        #print(qkv.shape)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
-        # Use flash_attn_func for optimized attention computation
-        #attn_output, _ = self.attn_layer(qkv)
-        
-        attn_output = flash_attn_qkvpacked_func(
-                qkv, 
-                dropout_p=self.attn_drop_prob if self.training else 0.0, 
-                softmax_scale=self.scale, 
-                causal=causal
-            )        
-        #print(attn_output.shape)
-        
-
+        if flash_attn_qkvpacked_func is not None:
+            attn_output = flash_attn_qkvpacked_func(
+                    qkv, 
+                    dropout_p=self.attn_drop_prob if self.training else 0.0, 
+                    softmax_scale=self.scale, 
+                    causal=causal
+                )
+        else:
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop_prob if self.training else 0.0,
+                is_causal=causal,
+                scale=self.scale,
+            )
+            attn_output = attn_output.permute(0, 2, 1, 3)
         
         x = attn_output.reshape(B, N, C) 
         x = self.proj(x)
@@ -913,6 +916,13 @@ class LEASE_DecLoss_ViT(nn.Module):
 
 
     @torch.compiler.disable
+    def _sample_mask_params(self, bsz, L, dev):
+        """Non-compilable: scipy truncnorm. Returns mask_rate (float), num_masked (int)."""
+        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
+        num_masked = int(np.ceil(L * mask_rate))
+        return mask_rate, num_masked
+
+    @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -926,8 +936,7 @@ class LEASE_DecLoss_ViT(nn.Module):
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
-        num_masked = int(np.ceil(L * mask_rate))
+        mask_rate, num_masked = self._sample_mask_params(bsz, L, dev)
         mask_idx   = perm[:, :num_masked]
 
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
@@ -1091,7 +1100,7 @@ class LEASE_DecLoss_ViT(nn.Module):
             weights = F.softmax(sims_top / max(teacher_tau, 1e-6), dim=1)  # [N, k_sel]; sum=1
 
         logp_sel = logp.gather(1, idx_top)              # [N, k_sel]
-        loss = -(weights * logp_sel).sum(dim=1).mean()
+        loss = -(weights * logp_sel).sum(dim=1)
         return loss
 
     def masked_dino_ce(self, dec_feats_257, dino_idx_256, mask_full_257, tau=None):
@@ -1373,6 +1382,13 @@ class LEASEViT(nn.Module):
 
 
     @torch.compiler.disable
+    def _sample_mask_params(self, bsz, L, dev):
+        """Non-compilable: scipy truncnorm. Returns mask_rate (float), num_masked (int)."""
+        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
+        num_masked = int(np.ceil(L * mask_rate))
+        return mask_rate, num_masked
+
+    @torch.compiler.disable
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -1381,13 +1397,12 @@ class LEASEViT(nn.Module):
         L = 256
         K_keep = 128
 
-        # ---- sample permutation → drop/keep & mask  ----
+        # ---- sample permutation → drop/keep & mask ----
         perm = torch.rand(bsz, L, device=dev).argsort(dim=1)
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
-        num_masked = int(np.ceil(L * mask_rate))
+        mask_rate, num_masked = self._sample_mask_params(bsz, L, dev)
         mask_idx   = perm[:, :num_masked]
 
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
@@ -1551,7 +1566,7 @@ class LEASEViT(nn.Module):
             weights = F.softmax(sims_top / max(teacher_tau, 1e-6), dim=1)  # [N, k_sel]; sum=1
 
         logp_sel = logp.gather(1, idx_top)              # [N, k_sel]
-        loss = -(weights * logp_sel).sum(dim=1).mean()
+        loss = -(weights * logp_sel).sum(dim=1)
         return loss
 
     def masked_dino_ce(self, dec_feats_257, dino_idx_256, mask_full_257, tau=None):
@@ -1963,7 +1978,7 @@ class LeaseInference(nn.Module):
             weights = F.softmax(sims_top / max(teacher_tau, 1e-6), dim=1)
 
         logp_sel = logp.gather(1, idx_top)
-        loss = -(weights * logp_sel).sum(dim=1).mean()
+        loss = -(weights * logp_sel).sum(dim=1)
         return loss
 
     def masked_dino_ce(self, dec_feats_257, dino_idx_256, mask_full_257, tau=None):
