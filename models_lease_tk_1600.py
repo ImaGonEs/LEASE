@@ -26,12 +26,7 @@ import csv
 import os
 
 
-try:
-    from flash_attn import flash_attn_qkvpacked_func
-    print("Successfully imported flash_attn_qkvpacked_func")
-except ImportError:
-    flash_attn_qkvpacked_func = None
-    print("flash_attn_qkvpacked_func is not available, proceeding without it.")
+from flash_attn import flash_attn_qkvpacked_func
 
 
 try:
@@ -39,6 +34,11 @@ try:
     print("Successfully imported VQGAN")
 except ImportError:
     print("VQGAN is not available, proceeding without it.")
+# TODO: investigate whether torch.set_float32_matmul_precision("high") is needed.
+# Enables TF32 tensor cores on Ampere+ GPUs for matmul speedup.
+# Currently set in all profiling scripts (~/lease_profiling/*.py) but not in the model.
+# If compile already uses bfloat16, this may be redundant.
+
 
 
 class GatherLayer(torch.autograd.Function):
@@ -270,24 +270,12 @@ class FlashAttentionLayer(nn.Module):
         
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
-        if flash_attn_qkvpacked_func is not None:
-            attn_output = flash_attn_qkvpacked_func(
-                    qkv, 
-                    dropout_p=self.attn_drop_prob if self.training else 0.0, 
-                    softmax_scale=self.scale, 
-                    causal=causal
-                )
-        else:
-            qkv = qkv.permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop_prob if self.training else 0.0,
-                is_causal=causal,
-                scale=self.scale,
+        attn_output = flash_attn_qkvpacked_func(
+                qkv, 
+                dropout_p=self.attn_drop_prob if self.training else 0.0, 
+                softmax_scale=self.scale, 
+                causal=causal
             )
-            attn_output = attn_output.permute(0, 2, 1, 3)
-        
         x = attn_output.reshape(B, N, C) 
         x = self.proj(x)
         x = self.proj_drop(x)

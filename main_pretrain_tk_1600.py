@@ -95,7 +95,6 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_dir',
                         help='path where to tensorboard log')
-    parser.add_argument('--compile', action='store_true', help='Apply torch.compile')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -335,11 +334,13 @@ def main(args):
 
 
     model.to(device)
-    
-    if args.compile:
-        import torch as _torch
-        print('Applying torch.compile(reduce-overhead)...')
-        import torch._inductor.config as _ind_cfg; _ind_cfg.triton.cudagraphs = True; model = _torch.compile(model, mode="reduce-overhead")
+
+    # torch.compile with cudagraphs for training throughput (~1.5x speedup on Ampere+)
+    import torch._inductor.config
+    torch._inductor.config.triton.cudagraphs = True
+    model.resample_mask_ratio()  # pre-sample once before compile
+    model = torch.compile(model, mode='reduce-overhead')
+    print('torch.compile applied (mode=reduce-overhead, cudagraphs=True)')
 
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
@@ -366,7 +367,7 @@ def main(args):
 
 
 
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95), fused=True)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
 
 
     print(optimizer)
