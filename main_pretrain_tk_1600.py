@@ -335,7 +335,11 @@ def main(args):
 
     model.to(device)
 
-    # torch.compile with cudagraphs for training throughput (~1.5x speedup on Ampere+)
+    # ── Optimization 3: torch.compile with cudagraphs ──
+# Compiles full LEASEViT (encoder + decoder) with reduce-overhead mode.
+# CUDAGraphs captures static compute graph for replay (~1.5x throughput).
+# Requires cudagraph_mark_step_begin() in training loop (engine_pretrain.py).
+# torch.compile with cudagraphs for training throughput (~1.5x speedup on Ampere+)
     import torch._inductor.config
     torch._inductor.config.triton.cudagraphs = True
     model.resample_mask_ratio()  # pre-sample once before compile

@@ -74,6 +74,8 @@ def train_one_epoch_two_losses_tk(model: torch.nn.Module,
     timer = IterationTimer(warmup=10, measure=1000)
 
     for data_iter_step, (vq_idx, labels, *_) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # ── Optimization 3 (cont): signal cudagraph step boundary ──
+        # Required for cudagraph replay under reduce-overhead mode.
         torch.compiler.cudagraph_mark_step_begin()
 
         if data_iter_step % accum_iter == 0:

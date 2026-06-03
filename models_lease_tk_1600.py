@@ -26,6 +26,7 @@ import csv
 import os
 
 
+# ── Optimization 1: flash_attn only (no sdpa fallback) ──
 from flash_attn import flash_attn_qkvpacked_func
 
 
@@ -798,7 +799,11 @@ class LEASE_DecLoss_ViT(nn.Module):
             (mask_ratio_max - mask_ratio_mu) / mask_ratio_std,
             loc=mask_ratio_mu, scale=mask_ratio_std
         )
-        # Persistent buffer for random num_masked per step.
+        # ── Optimization 2: buffer tensor for random num_masked per step ──
+# Eliminates 51 cudagraph branches (was: Python int causing value-dependent guards).
+# _sample_mask_params (graph-broken) writes random value here each step.
+# Dynamo guards on buffer identity (stable), not value (dynamic).
+# Persistent buffer for random num_masked per step.
         # Updated by _sample_mask_params (graph-broken) before each forward_encoder.
         # Dynamo guards on buffer identity (stable), not value → single cudagraph.
         self.register_buffer('_num_masked_buf', torch.zeros(1, dtype=torch.long))
@@ -1137,7 +1142,9 @@ class LEASE_DecLoss_ViT(nn.Module):
         dino_idx: (B,256) DINO token ids in [0..K-1] (used for InfoNCE/CE teacher)
         labels:   (B,)    class labels (optional)
         """
-        # ---- Sample random mask ratio per step (graph break, writes buffer) ----
+        # ── Optimization 2 (cont): resample random mask ratio per step ──
+# Graph break here (scipy) writes to _num_masked_buf before compiled encoder runs.
+# ---- Sample random mask ratio per step (graph break, writes buffer) ----
         self._sample_mask_params(vq_idx.size(0), 256, vq_idx.device)
 
         # ---- Encode (VQ-only) ----
@@ -1278,7 +1285,11 @@ class LEASEViT(nn.Module):
             (mask_ratio_max - mask_ratio_mu) / mask_ratio_std,
             loc=mask_ratio_mu, scale=mask_ratio_std
         )
-        # Persistent buffer for random num_masked per step.
+        # ── Optimization 2: buffer tensor for random num_masked per step ──
+# Eliminates 51 cudagraph branches (was: Python int causing value-dependent guards).
+# _sample_mask_params (graph-broken) writes random value here each step.
+# Dynamo guards on buffer identity (stable), not value (dynamic).
+# Persistent buffer for random num_masked per step.
         # Updated by _sample_mask_params (graph-broken) before each forward_encoder.
         # Dynamo guards on buffer identity (stable), not value → single cudagraph.
         self.register_buffer('_num_masked_buf', torch.zeros(1, dtype=torch.long))
@@ -1617,7 +1628,9 @@ class LEASEViT(nn.Module):
         dino_idx: (B,256) DINO token ids in [0..K-1] (used for InfoNCE/CE teacher)
         labels:   (B,)    class labels (optional)
         """
-        # ---- Sample random mask ratio per step (graph break, writes buffer) ----
+        # ── Optimization 2 (cont): resample random mask ratio per step ──
+# Graph break here (scipy) writes to _num_masked_buf before compiled encoder runs.
+# ---- Sample random mask ratio per step (graph break, writes buffer) ----
         self._sample_mask_params(vq_idx.size(0), 256, vq_idx.device)
 
         # ---- Encode (VQ-only) ----
