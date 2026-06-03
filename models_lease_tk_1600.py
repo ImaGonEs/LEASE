@@ -810,6 +810,10 @@ class LEASE_DecLoss_ViT(nn.Module):
             (mask_ratio_max - mask_ratio_mu) / mask_ratio_std,
             loc=mask_ratio_mu, scale=mask_ratio_std
         )
+        # Persistent buffer for random num_masked per step.
+        # Updated by _sample_mask_params (graph-broken) before each forward_encoder.
+        # Dynamo guards on buffer identity (stable), not value → single cudagraph.
+        self.register_buffer('_num_masked_buf', torch.zeros(1, dtype=torch.long))
 
         # --------------------------------------------------------------------------
         # Encoder 
@@ -917,12 +921,19 @@ class LEASE_DecLoss_ViT(nn.Module):
 
     @torch.compiler.disable
     def _sample_mask_params(self, bsz, L, dev):
-        """Non-compilable: scipy truncnorm. Returns num_masked (int)."""
+        """Non-compilable: scipy truncnorm. Writes random num_masked to buffer.
+        Returns num_masked (int) for convenience."""
         mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
         num_masked = int(np.ceil(L * mask_rate))
+        self._num_masked_buf[0] = num_masked
         return num_masked
 
-    @torch.compiler.disable
+    def resample_mask_ratio(self):
+        """Sample mask ratio once from distribution (writes to buffer).
+        Call after to(device), before torch.compile()."""
+        self._sample_mask_params(1, 256, next(self.parameters()).device)
+
+    # @torch.compiler.disable removed: encoder now compiled for cudagraph replay
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -936,13 +947,12 @@ class LEASE_DecLoss_ViT(nn.Module):
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        num_masked = self._sample_mask_params(bsz, L, dev)
-
+        # Buffer tensor (stable identity → single cudagraph, dynamic value per step)
         # Fixed-shape boolean masks (no variable-length slice → compile-friendly)
         ranks = torch.arange(L, device=dev).unsqueeze(0).expand(bsz, -1)
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
         dropped_256 = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
-        masked_256.scatter_(1, perm, ranks < num_masked)
+        masked_256.scatter_(1, perm, ranks < self._num_masked_buf)
         dropped_256.scatter_(1, perm, ranks < (L - K_keep))
 
         # ---- apply mask token to INPUT IDs only ----
@@ -1139,6 +1149,9 @@ class LEASE_DecLoss_ViT(nn.Module):
         dino_idx: (B,256) DINO token ids in [0..K-1] (used for InfoNCE/CE teacher)
         labels:   (B,)    class labels (optional)
         """
+        # ---- Sample random mask ratio per step (graph break, writes buffer) ----
+        self._sample_mask_params(vq_idx.size(0), 256, vq_idx.device)
+
         # ---- Encode (VQ-only) ----
         x_with_cls, gt_vq256, keep_idx, masked_256, dropped_256 = self.forward_encoder(vq_idx, labels)
 
@@ -1277,6 +1290,10 @@ class LEASEViT(nn.Module):
             (mask_ratio_max - mask_ratio_mu) / mask_ratio_std,
             loc=mask_ratio_mu, scale=mask_ratio_std
         )
+        # Persistent buffer for random num_masked per step.
+        # Updated by _sample_mask_params (graph-broken) before each forward_encoder.
+        # Dynamo guards on buffer identity (stable), not value → single cudagraph.
+        self.register_buffer('_num_masked_buf', torch.zeros(1, dtype=torch.long))
 
         # --------------------------------------------------------------------------
         # Encoder 
@@ -1384,12 +1401,19 @@ class LEASEViT(nn.Module):
 
     @torch.compiler.disable
     def _sample_mask_params(self, bsz, L, dev):
-        """Non-compilable: scipy truncnorm. Returns num_masked (int)."""
+        """Non-compilable: scipy truncnorm. Writes random num_masked to buffer.
+        Returns num_masked (int) for convenience."""
         mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
         num_masked = int(np.ceil(L * mask_rate))
+        self._num_masked_buf[0] = num_masked
         return num_masked
 
-    @torch.compiler.disable
+    def resample_mask_ratio(self):
+        """Sample mask ratio once from distribution (writes to buffer).
+        Call after to(device), before torch.compile()."""
+        self._sample_mask_params(1, 256, next(self.parameters()).device)
+
+    # @torch.compiler.disable removed: encoder now compiled for cudagraph replay
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -1403,13 +1427,12 @@ class LEASEViT(nn.Module):
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        num_masked = self._sample_mask_params(bsz, L, dev)
-
+        # Buffer tensor (stable identity → single cudagraph, dynamic value per step)
         # Fixed-shape boolean masks (no variable-length slice → compile-friendly)
         ranks = torch.arange(L, device=dev).unsqueeze(0).expand(bsz, -1)
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
         dropped_256 = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
-        masked_256.scatter_(1, perm, ranks < num_masked)
+        masked_256.scatter_(1, perm, ranks < self._num_masked_buf)
         dropped_256.scatter_(1, perm, ranks < (L - K_keep))
 
         # ---- apply mask token to INPUT IDs only  ----
@@ -1606,6 +1629,9 @@ class LEASEViT(nn.Module):
         dino_idx: (B,256) DINO token ids in [0..K-1] (used for InfoNCE/CE teacher)
         labels:   (B,)    class labels (optional)
         """
+        # ---- Sample random mask ratio per step (graph break, writes buffer) ----
+        self._sample_mask_params(vq_idx.size(0), 256, vq_idx.device)
+
         # ---- Encode (VQ-only) ----
         x_with_cls, gt_vq256, keep_idx, masked_256, dropped_256 = self.forward_encoder(vq_idx, labels)
 
