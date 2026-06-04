@@ -2381,4 +2381,3 @@ def inference_lease_vit_large_patch16_single(**kwargs):
         decoder_embed_dim=1024, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
-

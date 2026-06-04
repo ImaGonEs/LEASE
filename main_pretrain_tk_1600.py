@@ -300,7 +300,7 @@ def main(args):
         print(meta)
 
 
-    if True:  # args.distributed:
+    if False:  # revert:   # args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
