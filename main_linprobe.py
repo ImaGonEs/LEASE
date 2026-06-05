@@ -132,7 +132,7 @@ def main(args):
     print(dataset_train) 
     print(dataset_val)
 
-    if True:  # args.distributed:
+    if False:  # revert:   # args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(

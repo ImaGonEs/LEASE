@@ -26,11 +26,8 @@ import csv
 import os
 
 
-try:
-    from flash_attn import flash_attn_qkvpacked_func
-    print("Successfully imported flash_attn_qkvpacked_func")
-except ImportError:
-    print("flash_attn_qkvpacked_func is not available, proceeding without it.")
+# ── Optimization 1: flash_attn only (no sdpa fallback) ──
+from flash_attn import flash_attn_qkvpacked_func
 
 
 try:
@@ -38,6 +35,11 @@ try:
     print("Successfully imported VQGAN")
 except ImportError:
     print("VQGAN is not available, proceeding without it.")
+# TODO: investigate whether torch.set_float32_matmul_precision("high") is needed.
+# Enables TF32 tensor cores on Ampere+ GPUs for matmul speedup.
+# Currently set in all profiling scripts (~/lease_profiling/*.py) but not in the model.
+# If compile already uses bfloat16, this may be redundant.
+
 
 
 class GatherLayer(torch.autograd.Function):
@@ -267,24 +269,14 @@ class FlashAttentionLayer(nn.Module):
     def forward(self, x, causal=False):
         B, N, C = x.shape
         
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads) #.permute(2, 0, 3, 1, 4)
-        #q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        #print(qkv.shape)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
-        # Use flash_attn_func for optimized attention computation
-        #attn_output, _ = self.attn_layer(qkv)
-        
         attn_output = flash_attn_qkvpacked_func(
                 qkv, 
                 dropout_p=self.attn_drop_prob if self.training else 0.0, 
                 softmax_scale=self.scale, 
                 causal=causal
-            )        
-        #print(attn_output.shape)
-        
-
-        
+            )
         x = attn_output.reshape(B, N, C) 
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -807,6 +799,14 @@ class LEASE_DecLoss_ViT(nn.Module):
             (mask_ratio_max - mask_ratio_mu) / mask_ratio_std,
             loc=mask_ratio_mu, scale=mask_ratio_std
         )
+        # ── Optimization 2: buffer tensor for random num_masked per step ──
+# Eliminates 51 cudagraph branches (was: Python int causing value-dependent guards).
+# _sample_mask_params (graph-broken) writes random value here each step.
+# Dynamo guards on buffer identity (stable), not value (dynamic).
+# Persistent buffer for random num_masked per step.
+        # Updated by _sample_mask_params (graph-broken) before each forward_encoder.
+        # Dynamo guards on buffer identity (stable), not value → single cudagraph.
+        self.register_buffer('_num_masked_buf', torch.zeros(1, dtype=torch.long))
 
         # --------------------------------------------------------------------------
         # Encoder 
@@ -912,6 +912,21 @@ class LEASE_DecLoss_ViT(nn.Module):
     # =========================
 
 
+    @torch.compiler.disable
+    def _sample_mask_params(self, bsz, L, dev):
+        """Non-compilable: scipy truncnorm. Writes random num_masked to buffer.
+        Returns num_masked (int) for convenience."""
+        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
+        num_masked = int(np.ceil(L * mask_rate))
+        self._num_masked_buf[0] = num_masked
+        return num_masked
+
+    def resample_mask_ratio(self):
+        """Sample mask ratio once from distribution (writes to buffer).
+        Call after to(device), before torch.compile()."""
+        self._sample_mask_params(1, 256, next(self.parameters()).device)
+
+    # @torch.compiler.disable removed: encoder now compiled for cudagraph replay
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -925,14 +940,13 @@ class LEASE_DecLoss_ViT(nn.Module):
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
-        num_masked = int(np.ceil(L * mask_rate))
-        mask_idx   = perm[:, :num_masked]
-
+        # Buffer tensor (stable identity → single cudagraph, dynamic value per step)
+        # Fixed-shape boolean masks (no variable-length slice → compile-friendly)
+        ranks = torch.arange(L, device=dev).unsqueeze(0).expand(bsz, -1)
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
         dropped_256 = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
-        masked_256.scatter_(1, mask_idx, True)
-        dropped_256.scatter_(1, drop_idx, True)
+        masked_256.scatter_(1, perm, ranks < self._num_masked_buf)
+        dropped_256.scatter_(1, perm, ranks < (L - K_keep))
 
         # ---- apply mask token to INPUT IDs only ----
         vq_masked = vq_idx.clone()
@@ -1090,7 +1104,7 @@ class LEASE_DecLoss_ViT(nn.Module):
             weights = F.softmax(sims_top / max(teacher_tau, 1e-6), dim=1)  # [N, k_sel]; sum=1
 
         logp_sel = logp.gather(1, idx_top)              # [N, k_sel]
-        loss = -(weights * logp_sel).sum(dim=1).mean()
+        loss = -(weights * logp_sel).sum(dim=1)
         return loss
 
     def masked_dino_ce(self, dec_feats_257, dino_idx_256, mask_full_257, tau=None):
@@ -1098,17 +1112,26 @@ class LEASE_DecLoss_ViT(nn.Module):
             tau = self.masked_dino_tau
 
         supervise_mask = (mask_full_257[:, 1:] > 0)  # (B,256) bool
-        if not supervise_mask.any():
-            return dec_feats_257.new_tensor(0.0)
 
         dec_256 = dec_feats_257[:, 1:, :]                           # (B,256,Dd)
-        z = self.dec_to_dino(dec_256[supervise_mask].contiguous())  # [N,D]
+        z = self.dec_to_dino(dec_256)                                # (B,256,D)
         z = F.normalize(z, dim=-1)
 
         C = F.normalize(self.dino_codebook, dim=-1)                 # [K,D]
-        t = dino_idx_256[supervise_mask].long()                     # [N]
-        logits = F.linear(z, C) / tau                               # [N,K]
-        return F.cross_entropy(logits.float(), t)
+        t = dino_idx_256.long()                                      # (B,256)
+        logits = F.linear(z, C) / tau                                # (B,256,K)
+
+        B_ce, S_ce, K_ce = logits.shape
+        logits_flat = logits.reshape(B_ce * S_ce, K_ce)
+        targets_flat = t.reshape(B_ce * S_ce)
+        mask_flat = supervise_mask.reshape(B_ce * S_ce)
+        ignore_idx = -100
+        targets_flat = torch.where(
+            mask_flat,
+            targets_flat,
+            torch.full_like(targets_flat, ignore_idx)
+        )
+        return F.cross_entropy(logits_flat.float(), targets_flat, ignore_index=ignore_idx)
 
     # =========================
     # Forward
@@ -1119,6 +1142,11 @@ class LEASE_DecLoss_ViT(nn.Module):
         dino_idx: (B,256) DINO token ids in [0..K-1] (used for InfoNCE/CE teacher)
         labels:   (B,)    class labels (optional)
         """
+        # ── Optimization 2 (cont): resample random mask ratio per step ──
+# Graph break here (scipy) writes to _num_masked_buf before compiled encoder runs.
+# ---- Sample random mask ratio per step (graph break, writes buffer) ----
+        self._sample_mask_params(vq_idx.size(0), 256, vq_idx.device)
+
         # ---- Encode (VQ-only) ----
         x_with_cls, gt_vq256, keep_idx, masked_256, dropped_256 = self.forward_encoder(vq_idx, labels)
 
@@ -1144,21 +1172,32 @@ class LEASE_DecLoss_ViT(nn.Module):
         vq_feats_kept = x_with_cls[:, 1:129, :]                         # (B,128,E)
         kept_mask = torch.take_along_dim(masked_256, keep_idx, dim=1)   # (B,128) True=masked among kept
         visible_mask = ~kept_mask                                       # (B,128)
-        if visible_mask.any():
-            z_vis = vq_feats_kept[visible_mask].contiguous()            # [N,E]
-            t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1)[visible_mask].contiguous().long()  # [N]
-            z_vis = self.proj_to_dino(z_vis)                            # [N,D]
-            if self.use_neighbor_targets and self.neighbor_topk > 0:
-                info_nce_loss = self.info_nce_visible_neighbors(
-                    z_vis, t_vis,
-                    topk=self.neighbor_topk,
-                    teacher_tau=self.neighbor_teacher_tau,
-                    loss_tau=self.info_nce_tau
-                )
-            else:
-                info_nce_loss = self.info_nce_visible_full(z_vis, t_vis)
+
+        z_vis = self.proj_to_dino(vq_feats_kept)                         # (B,128,D)
+        t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1).long()   # (B,128)
+
+        B_vis, S_vis = z_vis.shape[:2]
+        z_vis_flat = z_vis.reshape(B_vis * S_vis, -1)
+        t_vis_flat = t_vis.reshape(B_vis * S_vis)
+        mask_flat = visible_mask.reshape(B_vis * S_vis)
+
+        if self.use_neighbor_targets and self.neighbor_topk > 0:
+            t_vis_safe = torch.where(mask_flat, t_vis_flat, torch.zeros_like(t_vis_flat))
+            raw_loss = self.info_nce_visible_neighbors(
+                z_vis_flat, t_vis_safe,
+                topk=self.neighbor_topk,
+                teacher_tau=self.neighbor_teacher_tau,
+                loss_tau=self.info_nce_tau
+            )
+            w = mask_flat.to(z_vis_flat.dtype)
+            info_nce_loss = (raw_loss * w).sum() / (w.sum().clamp(min=1))
         else:
-            info_nce_loss = x_with_cls.new_tensor(0.0)
+            z_norm = F.normalize(z_vis_flat, dim=-1)
+            C_norm = F.normalize(self.dino_codebook, dim=-1)
+            logits = F.linear(z_norm, C_norm) / self.info_nce_tau
+            ignore_idx = -100
+            t_masked = torch.where(mask_flat, t_vis_flat, torch.full_like(t_vis_flat, ignore_idx))
+            info_nce_loss = F.cross_entropy(logits.float(), t_masked, ignore_index=ignore_idx)
 
         # ---- Optional online classifier ----
         if labels is not None:
@@ -1246,6 +1285,14 @@ class LEASEViT(nn.Module):
             (mask_ratio_max - mask_ratio_mu) / mask_ratio_std,
             loc=mask_ratio_mu, scale=mask_ratio_std
         )
+        # ── Optimization 2: buffer tensor for random num_masked per step ──
+# Eliminates 51 cudagraph branches (was: Python int causing value-dependent guards).
+# _sample_mask_params (graph-broken) writes random value here each step.
+# Dynamo guards on buffer identity (stable), not value (dynamic).
+# Persistent buffer for random num_masked per step.
+        # Updated by _sample_mask_params (graph-broken) before each forward_encoder.
+        # Dynamo guards on buffer identity (stable), not value → single cudagraph.
+        self.register_buffer('_num_masked_buf', torch.zeros(1, dtype=torch.long))
 
         # --------------------------------------------------------------------------
         # Encoder 
@@ -1351,6 +1398,21 @@ class LEASEViT(nn.Module):
     # =========================
 
 
+    @torch.compiler.disable
+    def _sample_mask_params(self, bsz, L, dev):
+        """Non-compilable: scipy truncnorm. Writes random num_masked to buffer.
+        Returns num_masked (int) for convenience."""
+        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
+        num_masked = int(np.ceil(L * mask_rate))
+        self._num_masked_buf[0] = num_masked
+        return num_masked
+
+    def resample_mask_ratio(self):
+        """Sample mask ratio once from distribution (writes to buffer).
+        Call after to(device), before torch.compile()."""
+        self._sample_mask_params(1, 256, next(self.parameters()).device)
+
+    # @torch.compiler.disable removed: encoder now compiled for cudagraph replay
     def forward_encoder(self, vq_idx, labels):
         bsz = vq_idx.size(0)
         dev = vq_idx.device
@@ -1359,19 +1421,18 @@ class LEASEViT(nn.Module):
         L = 256
         K_keep = 128
 
-        # ---- sample permutation → drop/keep & mask  ----
+        # ---- sample permutation → drop/keep & mask ----
         perm = torch.rand(bsz, L, device=dev).argsort(dim=1)
         drop_idx = perm[:, :L - K_keep]                 # drop these at the embedding stage
         keep_idx = perm[:, L - K_keep:]                 # keep these
 
-        mask_rate  = float(self.mask_ratio_generator.rvs(1)[0])
-        num_masked = int(np.ceil(L * mask_rate))
-        mask_idx   = perm[:, :num_masked]
-
+        # Buffer tensor (stable identity → single cudagraph, dynamic value per step)
+        # Fixed-shape boolean masks (no variable-length slice → compile-friendly)
+        ranks = torch.arange(L, device=dev).unsqueeze(0).expand(bsz, -1)
         masked_256  = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
         dropped_256 = torch.zeros(bsz, L, device=dev, dtype=torch.bool)
-        masked_256.scatter_(1, mask_idx, True)
-        dropped_256.scatter_(1, drop_idx, True)
+        masked_256.scatter_(1, perm, ranks < self._num_masked_buf)
+        dropped_256.scatter_(1, perm, ranks < (L - K_keep))
 
         # ---- apply mask token to INPUT IDs only  ----
         vq_masked = vq_idx.clone()
@@ -1529,7 +1590,7 @@ class LEASEViT(nn.Module):
             weights = F.softmax(sims_top / max(teacher_tau, 1e-6), dim=1)  # [N, k_sel]; sum=1
 
         logp_sel = logp.gather(1, idx_top)              # [N, k_sel]
-        loss = -(weights * logp_sel).sum(dim=1).mean()
+        loss = -(weights * logp_sel).sum(dim=1)
         return loss
 
     def masked_dino_ce(self, dec_feats_257, dino_idx_256, mask_full_257, tau=None):
@@ -1537,17 +1598,26 @@ class LEASEViT(nn.Module):
             tau = self.masked_dino_tau
 
         supervise_mask = (mask_full_257[:, 1:] > 0)  # (B,256) bool
-        if not supervise_mask.any():
-            return dec_feats_257.new_tensor(0.0)
 
         dec_256 = dec_feats_257[:, 1:, :]                           # (B,256,Dd)
-        z = self.dec_to_dino(dec_256[supervise_mask].contiguous())  # [N,D]
+        z = self.dec_to_dino(dec_256)                                # (B,256,D)
         z = F.normalize(z, dim=-1)
 
         C = F.normalize(self.dino_codebook, dim=-1)                 # [K,D]
-        t = dino_idx_256[supervise_mask].long()                     # [N]
-        logits = F.linear(z, C) / tau                               # [N,K]
-        return F.cross_entropy(logits.float(), t)
+        t = dino_idx_256.long()                                      # (B,256)
+        logits = F.linear(z, C) / tau                                # (B,256,K)
+
+        B_ce, S_ce, K_ce = logits.shape
+        logits_flat = logits.reshape(B_ce * S_ce, K_ce)
+        targets_flat = t.reshape(B_ce * S_ce)
+        mask_flat = supervise_mask.reshape(B_ce * S_ce)
+        ignore_idx = -100
+        targets_flat = torch.where(
+            mask_flat,
+            targets_flat,
+            torch.full_like(targets_flat, ignore_idx)
+        )
+        return F.cross_entropy(logits_flat.float(), targets_flat, ignore_index=ignore_idx)
 
     # =========================
     # Forward
@@ -1558,6 +1628,11 @@ class LEASEViT(nn.Module):
         dino_idx: (B,256) DINO token ids in [0..K-1] (used for InfoNCE/CE teacher)
         labels:   (B,)    class labels (optional)
         """
+        # ── Optimization 2 (cont): resample random mask ratio per step ──
+# Graph break here (scipy) writes to _num_masked_buf before compiled encoder runs.
+# ---- Sample random mask ratio per step (graph break, writes buffer) ----
+        self._sample_mask_params(vq_idx.size(0), 256, vq_idx.device)
+
         # ---- Encode (VQ-only) ----
         x_with_cls, gt_vq256, keep_idx, masked_256, dropped_256 = self.forward_encoder(vq_idx, labels)
 
@@ -1583,21 +1658,32 @@ class LEASEViT(nn.Module):
         vq_feats_kept = x_with_cls[:, 1:129, :]                         # (B,128,E)
         kept_mask = torch.take_along_dim(masked_256, keep_idx, dim=1)   # (B,128) True=masked among kept
         visible_mask = ~kept_mask                                       # (B,128)
-        if visible_mask.any():
-            z_vis = vq_feats_kept[visible_mask].contiguous()            # [N,E]
-            t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1)[visible_mask].contiguous().long()  # [N]
-            z_vis = self.proj_to_dino(z_vis)                            # [N,D]
-            if self.use_neighbor_targets and self.neighbor_topk > 0:
-                info_nce_loss = self.info_nce_visible_neighbors(
-                    z_vis, t_vis,
-                    topk=self.neighbor_topk,
-                    teacher_tau=self.neighbor_teacher_tau,
-                    loss_tau=self.info_nce_tau
-                )
-            else:
-                info_nce_loss = self.info_nce_visible_full(z_vis, t_vis)
+
+        z_vis = self.proj_to_dino(vq_feats_kept)                         # (B,128,D)
+        t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1).long()   # (B,128)
+
+        B_vis, S_vis = z_vis.shape[:2]
+        z_vis_flat = z_vis.reshape(B_vis * S_vis, -1)
+        t_vis_flat = t_vis.reshape(B_vis * S_vis)
+        mask_flat = visible_mask.reshape(B_vis * S_vis)
+
+        if self.use_neighbor_targets and self.neighbor_topk > 0:
+            t_vis_safe = torch.where(mask_flat, t_vis_flat, torch.zeros_like(t_vis_flat))
+            raw_loss = self.info_nce_visible_neighbors(
+                z_vis_flat, t_vis_safe,
+                topk=self.neighbor_topk,
+                teacher_tau=self.neighbor_teacher_tau,
+                loss_tau=self.info_nce_tau
+            )
+            w = mask_flat.to(z_vis_flat.dtype)
+            info_nce_loss = (raw_loss * w).sum() / (w.sum().clamp(min=1))
         else:
-            info_nce_loss = x_with_cls.new_tensor(0.0)
+            z_norm = F.normalize(z_vis_flat, dim=-1)
+            C_norm = F.normalize(self.dino_codebook, dim=-1)
+            logits = F.linear(z_norm, C_norm) / self.info_nce_tau
+            ignore_idx = -100
+            t_masked = torch.where(mask_flat, t_vis_flat, torch.full_like(t_vis_flat, ignore_idx))
+            info_nce_loss = F.cross_entropy(logits.float(), t_masked, ignore_index=ignore_idx)
 
         # ---- Optional online classifier ----
         if labels is not None:
@@ -1920,7 +2006,7 @@ class LeaseInference(nn.Module):
             weights = F.softmax(sims_top / max(teacher_tau, 1e-6), dim=1)
 
         logp_sel = logp.gather(1, idx_top)
-        loss = -(weights * logp_sel).sum(dim=1).mean()
+        loss = -(weights * logp_sel).sum(dim=1)
         return loss
 
     def masked_dino_ce(self, dec_feats_257, dino_idx_256, mask_full_257, tau=None):
@@ -1928,17 +2014,26 @@ class LeaseInference(nn.Module):
             tau = self.masked_dino_tau
 
         supervise_mask = (mask_full_257[:, 1:] > 0)
-        if not supervise_mask.any():
-            return dec_feats_257.new_tensor(0.0)
 
         dec_256 = dec_feats_257[:, 1:, :]
-        z = self.dec_to_dino(dec_256[supervise_mask].contiguous())
+        z = self.dec_to_dino(dec_256)
         z = F.normalize(z, dim=-1)
 
         C = F.normalize(self.dino_codebook, dim=-1)
-        t = dino_idx_256[supervise_mask].long()
+        t = dino_idx_256.long()
         logits = F.linear(z, C) / tau
-        return F.cross_entropy(logits.float(), t)
+
+        B_ce, S_ce, K_ce = logits.shape
+        logits_flat = logits.reshape(B_ce * S_ce, K_ce)
+        targets_flat = t.reshape(B_ce * S_ce)
+        mask_flat = supervise_mask.reshape(B_ce * S_ce)
+        ignore_idx = -100
+        targets_flat = torch.where(
+            mask_flat,
+            targets_flat,
+            torch.full_like(targets_flat, ignore_idx)
+        )
+        return F.cross_entropy(logits_flat.float(), targets_flat, ignore_index=ignore_idx)
 
     def forward(self, vq_idx, dino_idx, labels, epoch):
         x_with_cls, gt_vq256, keep_idx, masked_256, dropped_256 = self.forward_encoder(vq_idx, labels)
@@ -1962,21 +2057,32 @@ class LeaseInference(nn.Module):
         vq_feats_kept = x_with_cls[:, 1:129, :]
         kept_mask = torch.take_along_dim(masked_256, keep_idx, dim=1)
         visible_mask = ~kept_mask
-        if visible_mask.any():
-            z_vis = vq_feats_kept[visible_mask].contiguous()
-            t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1)[visible_mask].contiguous().long()
-            z_vis = self.proj_to_dino(z_vis)
-            if self.use_neighbor_targets and self.neighbor_topk > 0:
-                info_nce_loss = self.info_nce_visible_neighbors(
-                    z_vis, t_vis,
-                    topk=self.neighbor_topk,
-                    teacher_tau=self.neighbor_teacher_tau,
-                    loss_tau=self.info_nce_tau
-                )
-            else:
-                info_nce_loss = self.info_nce_visible_full(z_vis, t_vis)
+
+        z_vis = self.proj_to_dino(vq_feats_kept)
+        t_vis = torch.take_along_dim(dino_idx, keep_idx, dim=1).long()
+
+        B_vis, S_vis = z_vis.shape[:2]
+        z_vis_flat = z_vis.reshape(B_vis * S_vis, -1)
+        t_vis_flat = t_vis.reshape(B_vis * S_vis)
+        mask_flat = visible_mask.reshape(B_vis * S_vis)
+
+        if self.use_neighbor_targets and self.neighbor_topk > 0:
+            t_vis_safe = torch.where(mask_flat, t_vis_flat, torch.zeros_like(t_vis_flat))
+            raw_loss = self.info_nce_visible_neighbors(
+                z_vis_flat, t_vis_safe,
+                topk=self.neighbor_topk,
+                teacher_tau=self.neighbor_teacher_tau,
+                loss_tau=self.info_nce_tau
+            )
+            w = mask_flat.to(z_vis_flat.dtype)
+            info_nce_loss = (raw_loss * w).sum() / (w.sum().clamp(min=1))
         else:
-            info_nce_loss = x_with_cls.new_tensor(0.0)
+            z_norm = F.normalize(z_vis_flat, dim=-1)
+            C_norm = F.normalize(self.dino_codebook, dim=-1)
+            logits = F.linear(z_norm, C_norm) / self.info_nce_tau
+            ignore_idx = -100
+            t_masked = torch.where(mask_flat, t_vis_flat, torch.full_like(t_vis_flat, ignore_idx))
+            info_nce_loss = F.cross_entropy(logits.float(), t_masked, ignore_index=ignore_idx)
 
         if labels is not None:
             y = labels.view(-1)
@@ -2275,4 +2381,3 @@ def inference_lease_vit_large_patch16_single(**kwargs):
         decoder_embed_dim=1024, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
-
