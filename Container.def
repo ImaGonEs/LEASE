@@ -1,0 +1,43 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.06-py3
+
+%labels
+    Author marcelo
+    Repo https://github.com/ImaGonEs/LEASE
+    Description Singularity image for LEASE (Latent Space Encoding for Segmentation)
+    Base nvcr.io/nvidia/pytorch:25.06-py3 (PyTorch 2.8, CUDA 12.9)
+
+%files
+    requirements.txt /opt/LEASE/requirements.txt
+
+%post
+    # Install Python dependencies from the repo's requirements.txt
+    pip install --no-cache-dir -r /opt/LEASE/requirements.txt
+
+    # flash-attn: compile from source for GPU arch support
+    # The NGC base already includes CUDA dev headers and ninja
+    pip install --no-cache-dir flash-attn --no-build-isolation
+
+%environment
+    export PYTHONPATH=/opt/LEASE:${PYTHONPATH:-}
+
+%runscript
+    exec python "$@"
+
+%help
+    LEASE Singularity Image
+    =======================
+    Based on NVIDIA NGC PyTorch 25.06 (PyTorch 2.8 + CUDA 12.9).
+
+    Includes all dependencies from requirements.txt:
+      torch, torchvision, timm, numpy, scipy, Pillow,
+      omegaconf, pytorch-lightning, tqdm, einops,
+      matplotlib, tensorboard, flash-attn
+
+    Build:
+      sudo singularity build lease.sif Container.def
+
+    Usage:
+      singularity run --nv lease.sif main_pretrain_tk_1600.py --args...
+      singularity shell --nv lease.sif
+      singularity shell --nv -B /path/to/LEASE:/opt/LEASE lease.sif
