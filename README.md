@@ -117,10 +117,12 @@ Both scripts copy the checkpoint, verify it with an md5 checksum, record provena
 
 ## Citation
 
-> @inproceedings{estepa2026learning,
+```bash
+@inproceedings{estepa2026learning,
   title={Learning from semantic dictionaries: Discriminative codebook contrastive learning for unified visual representation and generation},
   author={Estepa, Imanol G and Rodr{\'\i}guez-de-Vera, Jes{\'u}s M and Nagarajan, Bhalaji and Radeva, Petia},
   booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
   pages={22456--22466},
   year={2026}
 }
+```
