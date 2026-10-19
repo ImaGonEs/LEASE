@@ -2,7 +2,7 @@
 
 ![](LEASE.png)
 
-Codebase for **LEASE — Learning From Semantic Dictionaries**, a generative pre-training method for Vision Transformers based on joint Codebook learning (forthcoming in CVPR 2026)! Based on MAGE codebase, this repository includes all required code to pretrain and evaluate either Sorcen (Echo Contrast based model) and LEASE. Feel free to fork!
+Codebase for **LEASE — Learning From Semantic Dictionaries**, a generative pre-training method for Vision Transformers based on joint Codebook learning (presented at CVPR 2026)! Based on MAGE codebase, this repository includes all required code to pretrain and evaluate either Sorcen (Echo Contrast based model) and LEASE. Feel free to fork!
 
 
 ## Models provided
@@ -117,4 +117,10 @@ Both scripts copy the checkpoint, verify it with an md5 checksum, record provena
 
 ## Citation
 
-> *To appear in CVPR'26 proceedings...*
+> @inproceedings{estepa2026learning,
+  title={Learning from semantic dictionaries: Discriminative codebook contrastive learning for unified visual representation and generation},
+  author={Estepa, Imanol G and Rodr{\'\i}guez-de-Vera, Jes{\'u}s M and Nagarajan, Bhalaji and Radeva, Petia},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={22456--22466},
+  year={2026}
+}
